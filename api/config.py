@@ -9511,6 +9511,12 @@ def _evict_session_agent(session_id: str) -> None:
     lifecycle entry is preserved (not unregistered) so a future commit can
     retry.
     """
+    try:
+        from api.native_auth import close_native_auth_task
+
+        close_native_auth_task(session_id)
+    except Exception:
+        logger.debug("Failed to close native auth task during agent eviction for %s", session_id)
     agent = None
     with SESSION_AGENT_CACHE_LOCK:
         entry = SESSION_AGENT_CACHE.pop(session_id, None)

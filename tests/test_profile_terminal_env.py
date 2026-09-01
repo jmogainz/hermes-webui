@@ -131,3 +131,33 @@ def test_streaming_thread_env_allows_profile_terminal_cwd_override():
     assert env["HERMES_SESSION_PLATFORM"] == "webui"
     assert env["HERMES_HOME"] == "/active/profile/home"
     assert env["TERMINAL_ENV"] == "ssh"
+
+
+def test_streaming_thread_env_preserves_only_operator_browser_cdp_bridge():
+    src = Path("api/streaming.py").read_text(encoding="utf-8")
+    match = re.search(
+        r"(def _build_agent_thread_env\(.*?\n)(?=\ndef |\nclass )",
+        src,
+        re.DOTALL,
+    )
+    assert match, "_build_agent_thread_env not found in api/streaming.py"
+    ns: dict = {}
+    exec(compile(match.group(1), "<streaming_extract>", "exec"), ns)
+
+    env = ns["_build_agent_thread_env"](
+        {
+            "HERMES_WEBUI_BROWSER_CDP_URL": "http://profile.invalid:9222",
+            "BROWSER_CDP_URL": "http://profile.invalid:9222",
+        },
+        "/active/workspace",
+        "active-session",
+        "/active/profile/home",
+        operator_env={
+            "HERMES_WEBUI_BROWSER_CDP_URL": "http://127.0.0.1:9246",
+            "HERMES_WEBUI_PASSWORD": "must-not-cross-thread-env",
+        },
+    )
+
+    assert env["HERMES_WEBUI_BROWSER_CDP_URL"] == "http://127.0.0.1:9246"
+    assert env["BROWSER_CDP_URL"] == "http://profile.invalid:9222"
+    assert "HERMES_WEBUI_PASSWORD" not in env
