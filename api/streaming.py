@@ -138,6 +138,12 @@ def get_stream_runtime_snapshot() -> dict[str, object]:
         # Keep the aggregates already summed from channels that read cleanly; a
         # late unexpected failure must not discard successful sibling counts.
         return result
+    try:
+        from api.native_auth import native_auth_diagnostics_snapshot
+
+        result["native_auth"] = native_auth_diagnostics_snapshot()
+    except Exception:
+        result["native_auth"] = {"bound_tasks": 0, "counters": {}}
     return result
 
 
@@ -2638,7 +2644,14 @@ def _extract_gateway_routing_metadata(agent, result, requested_model=None, reque
     return None
 
 
-def _build_agent_thread_env(profile_runtime_env: dict | None, workspace: str, session_id: str, profile_home: str) -> dict:
+def _build_agent_thread_env(
+    profile_runtime_env: dict | None,
+    workspace: str,
+    session_id: str,
+    profile_home: str,
+    *,
+    operator_env: dict | None = None,
+) -> dict:
     """Build thread-local agent env with per-run values overriding profile defaults.
 
     Profile runtime env may include TERMINAL_CWD from config.yaml. Passing it as
@@ -2646,6 +2659,16 @@ def _build_agent_thread_env(profile_runtime_env: dict | None, workspace: str, se
     agent starts, so merge into one dict first and let the active workspace win.
     """
     env = dict(profile_runtime_env or {})
+    # WebUI's browser-CDP bridge is operator/deployment state, not profile
+    # state. Preserve only this non-secret endpoint across the per-profile
+    # thread-env boundary so browser_exec reaches the browser selected by the
+    # WebUI owner. Do not merge arbitrary HERMES_WEBUI_* values: that namespace
+    # also contains passwords, passkeys, and OIDC credentials.
+    scoped_browser_cdp = str(
+        (operator_env or {}).get("HERMES_WEBUI_BROWSER_CDP_URL") or ""
+    ).strip()
+    if scoped_browser_cdp:
+        env["HERMES_WEBUI_BROWSER_CDP_URL"] = scoped_browser_cdp
     env.update({
         'TERMINAL_CWD': str(workspace),
         'HERMES_EXEC_ASK': '1',
@@ -8468,6 +8491,13 @@ def _close_evicted_agent_at_session_boundary(session_id: str, agent) -> bool:
     if agent is None:
         return True
 
+    try:
+        from api.native_auth import close_native_auth_task
+
+        close_native_auth_task(session_id)
+    except Exception:
+        logger.debug("Failed to close native auth task for evicted session %s", session_id)
+
     should_close_evicted_agent = True
     try:
         _lifecycle_commit_session_memory(session_id, agent=agent, wait=True)
@@ -8658,6 +8688,84 @@ def _refresh_cached_agent_primary_runtime_snapshot(agent) -> None:
             rt['anthropic_base_url'] = getattr(agent, '_anthropic_base_url')
         if hasattr(agent, '_is_anthropic_oauth'):
             rt['is_anthropic_oauth'] = getattr(agent, '_is_anthropic_oauth')
+
+
+def _bind_native_auth_component(
+    component,
+    *,
+    session_id: str,
+    stream_id: str,
+    put,
+    runtime=None,
+) -> bool:
+    """Bind status publication while preserving post-stream submit recovery."""
+    if not isinstance(component, dict):
+        return False
+    component_id = str(component.get("component_id") or "").strip()
+    if not component_id:
+        return False
+    if runtime is None:
+        from tools.native_auth_runtime import native_auth_runtime
+
+        runtime = native_auth_runtime
+
+    terminal_states = {"submitted", "failed", "cancelled", "expired"}
+
+    def _native_status_callback(state):
+        if not isinstance(state, dict):
+            return
+        raw_state = str(state.get("state") or "failed")
+        try:
+            wire_state = runtime.public_state(
+                component_id,
+                state={
+                    "accepted": "focused",
+                    "filled": "awaiting_browser",
+                    "submitted": "completed",
+                    "failed": "unavailable",
+                    "cancelled": "cancelled",
+                    "expired": "cancelled",
+                }.get(raw_state, "unavailable"),
+                cancel_reason=(
+                    "expired" if raw_state == "expired"
+                    else "user_cancelled" if raw_state == "cancelled"
+                    else None
+                ),
+            )
+        except Exception:
+            logger.debug("Failed to project native auth state", exc_info=True)
+            return
+        put("native_component_state", wire_state)
+        if raw_state in {"accepted", "filled", "submitted"}:
+            update_active_run(stream_id, phase="running")
+        if raw_state in terminal_states:
+            # The runtime removes a terminal context after this callback returns.
+            # Detach only the task publisher here: synchronously calling
+            # close_task() would re-notify this same status callback recursively.
+            try:
+                from api.native_auth import detach_native_auth_task
+
+                detach_native_auth_task(session_id, runtime=runtime)
+            except Exception:
+                logger.debug("Failed to detach terminal native auth task", exc_info=True)
+
+    try:
+        runtime.set_status_callback(component_id, _native_status_callback)
+        update_active_run(stream_id, phase="waiting_native_auth")
+        components = runtime.public_components(component_id)
+    except Exception:
+        logger.debug("Failed to bind native auth component", exc_info=True)
+        return False
+    for payload in components:
+        put("native_component", payload)
+    try:
+        put(
+            "native_component_state",
+            runtime.public_state(component_id, state="available"),
+        )
+    except Exception:
+        logger.debug("Failed to publish initial native auth state", exc_info=True)
+    return True
 
 
 def _run_agent_streaming(
@@ -9049,6 +9157,20 @@ def _run_agent_streaming(
         # If cancelled, drop all further events except the cancel event itself
         if cancel_event.is_set() and not _success_writeback_committed and event not in ('cancel', 'apperror'):
             return
+        if event in ('native_component', 'native_component_state'):
+            try:
+                from api.native_auth import project_native_auth_event
+
+                data = project_native_auth_event(event, data)
+            except Exception:
+                try:
+                    from api.native_auth import _count_native_auth
+
+                    _count_native_auth("projection_drops")
+                except Exception:
+                    pass
+                logger.warning("Dropped invalid native auth event for stream %s", stream_id)
+                return
         event_id = None
         if run_journal is not None:
             try:
@@ -9268,6 +9390,7 @@ def _run_agent_streaming(
             str(s.workspace),
             session_id,
             _profile_home,
+            operator_env=os.environ,
         )
         _streaming_hermes_home_override_ctx = _set_streaming_hermes_home_override(_profile_home)
         _set_thread_env(**_thread_env)
@@ -9657,6 +9780,21 @@ def _run_agent_streaming(
                 if reasoning_echo:
                     payload['reasoning_echo'] = True
                 put('interim_assistant', payload)
+
+            def on_native_component(component):
+                """Publish a trusted native component without credential data."""
+                try:
+                    from tools.native_auth_runtime import native_auth_runtime
+                except Exception:
+                    logger.debug("Native auth runtime unavailable", exc_info=True)
+                    return
+                _bind_native_auth_component(
+                    component,
+                    session_id=str(session_id or ""),
+                    stream_id=stream_id,
+                    put=put,
+                    runtime=native_auth_runtime,
+                )
 
             # Pre-initialise the activity counter here so on_tool (which
             # closes over it) never captures an unbound name even if this
@@ -10231,6 +10369,7 @@ def _run_agent_streaming(
                 stream_delta_callback=on_token,
                 reasoning_callback=on_reasoning,
                 tool_progress_callback=on_tool,
+                native_component_callback=on_native_component,
                 clarify_callback=(
                     lambda question, choices: _clarify_callback_impl(
                         question, choices, session_id, cancel_event, put
@@ -10243,6 +10382,18 @@ def _run_agent_streaming(
                 _agent_kwargs['reasoning_config'] = _reasoning_config
             if 'prefill_messages' not in _agent_params:
                 _agent_kwargs.pop('prefill_messages', None)
+            if 'native_component_callback' not in _agent_params:
+                _agent_kwargs.pop('native_component_callback', None)
+            else:
+                try:
+                    from api.native_auth import bind_native_auth_task
+
+                    bind_native_auth_task(
+                        str(session_id or ""),
+                        _agent_kwargs.get('native_component_callback'),
+                    )
+                except Exception:
+                    logger.debug('Failed to bind native auth task callback', exc_info=True)
             if 'interim_assistant_callback' in _agent_params:
                 _agent_kwargs['interim_assistant_callback'] = on_interim_assistant
             if 'tool_start_callback' in _agent_params:
@@ -10379,6 +10530,8 @@ def _run_agent_streaming(
                         agent.status_callback = _agent_kwargs.get('status_callback')
                     if hasattr(agent, 'interim_assistant_callback'):
                         agent.interim_assistant_callback = _agent_kwargs.get('interim_assistant_callback')
+                    if hasattr(agent, 'native_component_callback'):
+                        agent.native_component_callback = _agent_kwargs.get('native_component_callback')
                     if hasattr(agent, 'reasoning_callback'):
                         agent.reasoning_callback = _agent_kwargs.get('reasoning_callback')
                     if hasattr(agent, 'clarify_callback'):

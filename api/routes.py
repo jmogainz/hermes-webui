@@ -14876,6 +14876,169 @@ def _validate_session_toolsets_shape(toolsets):
     return toolsets
 
 
+_NATIVE_AUTH_MUTATION_PATHS = frozenset(
+    {"/api/native-auth/submit", "/api/native-auth/cancel"}
+)
+_NATIVE_AUTH_CLIENT_HEADER = "X-Semreh-Client"
+_NATIVE_AUTH_CLIENT_VALUE = "native-auth-v1"
+
+
+def _native_auth_is_loopback_authority(value: str) -> bool:
+    """Accept only a syntactically valid localhost/loopback HTTP authority."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    try:
+        parsed = urlsplit(f"//{value}")
+        host = parsed.hostname or ""
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    if (
+        not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or (port is not None and not 1 <= port <= 65535)
+    ):
+        return False
+    from api.auth import _is_loopback
+
+    return _is_loopback(host) or host.rstrip(".").lower() == "localhost"
+
+
+def _authorize_native_auth_mutation(handler, path: str) -> bool:
+    """Authorize before body/runtime access; the native header is not attestation.
+
+    Authenticated mode authorizes the verified WebUI principal plus request
+    provenance. Passwordless mode is direct-loopback test plumbing only and must
+    never be exposed through a reverse proxy.
+    """
+    if path not in _NATIVE_AUTH_MUTATION_PATHS:
+        return True
+
+    from api.auth import _is_loopback, is_auth_enabled, parse_cookie, verify_session
+
+    if is_auth_enabled():
+        cookie = parse_cookie(handler)
+        if not cookie or not verify_session(cookie):
+            j(handler, {"ok": False, "code": "authentication_required"}, status=401)
+            return False
+        has_browser_provenance = bool(
+            handler.headers.get("Origin")
+            or handler.headers.get("Referer")
+            or handler.headers.get("Sec-Fetch-Site")
+        )
+        if has_browser_provenance:
+            authorized = _check_same_origin_browser_request(
+                handler, require_provenance=True
+            )
+        else:
+            authorized = (
+                handler.headers.get(_NATIVE_AUTH_CLIENT_HEADER)
+                == _NATIVE_AUTH_CLIENT_VALUE
+            )
+        if not authorized:
+            j(handler, {"ok": False, "code": "forbidden"}, status=403)
+            return False
+        return True
+    client_address = getattr(handler, "client_address", None)
+    client_ip = client_address[0] if client_address else ""
+    has_forwarded_client = any(
+        handler.headers.get(name) is not None
+        for name in ("Forwarded", "X-Forwarded-For", "X-Real-IP")
+    )
+    if (
+        _is_loopback(client_ip)
+        and _native_auth_is_loopback_authority(handler.headers.get("Host", ""))
+        and not has_forwarded_client
+        and handler.headers.get(_NATIVE_AUTH_CLIENT_HEADER)
+        == _NATIVE_AUTH_CLIENT_VALUE
+    ):
+        return True
+    j(handler, {"ok": False, "code": "forbidden"}, status=403)
+    return False
+
+
+def _native_auth_agent_lookup(stream_id: str):
+    """Return the same-session AIAgent for one native-auth stream.
+
+    Native auth deliberately outlives the SSE stream: the model turn can finish
+    rendering the prompt while the user is still entering values. The per-stream
+    ``AGENT_INSTANCES`` entry is therefore gone by the time the native request
+    arrives, but WebUI's existing per-session LRU cache still owns the exact agent
+    and its in-process native-auth runtime. Recover from that cache only after
+    resolving the stream's persisted owner, and reject an identity mismatch.
+    """
+    try:
+        from api import config as api_config
+
+        with STREAMS_LOCK:
+            direct = api_config.AGENT_INSTANCES.get(stream_id)
+            if direct is not None:
+                return direct
+        owner_session_id = _stream_id_owner_session_id(stream_id)
+        if not owner_session_id:
+            return None
+        with STREAMS_LOCK:
+            candidates = [
+                agent
+                for agent in api_config.AGENT_INSTANCES.values()
+                if agent is not None
+                and str(getattr(agent, "session_id", "")) == owner_session_id
+            ]
+        if candidates:
+            return candidates[0] if len(candidates) == 1 else None
+
+        # The worker removes AGENT_INSTANCES during normal teardown, while the
+        # session cache intentionally keeps the agent alive across turns. Do not
+        # scan other cache entries: the stream journal is the owner binding.
+        with api_config.SESSION_AGENT_CACHE_LOCK:
+            cached_entry = api_config.SESSION_AGENT_CACHE.get(owner_session_id)
+            cached_agent = (
+                cached_entry[0]
+                if isinstance(cached_entry, tuple) and cached_entry
+                else None
+            )
+        if cached_agent is None:
+            return None
+        cached_session_id = str(getattr(cached_agent, "session_id", "") or "").strip()
+        if cached_session_id and cached_session_id != owner_session_id:
+            return None
+        return cached_agent
+    except Exception:
+        return None
+
+
+def _handle_native_auth_submit(handler, body) -> bool:
+    from api.native_auth import NativeAuthRequestError, submit_native_auth_request
+
+    try:
+        payload = submit_native_auth_request(body, agent_lookup=_native_auth_agent_lookup)
+    except NativeAuthRequestError as exc:
+        return j(handler, exc.public_payload(), status=exc.status)
+    return j(
+        handler,
+        payload,
+        extra_headers={"Cache-Control": "no-store"},
+    )
+
+
+def _handle_native_auth_cancel(handler, body) -> bool:
+    from api.native_auth import NativeAuthRequestError, cancel_native_auth_request
+
+    try:
+        payload = cancel_native_auth_request(body, agent_lookup=_native_auth_agent_lookup)
+    except NativeAuthRequestError as exc:
+        return j(handler, exc.public_payload(), status=exc.status)
+    return j(
+        handler,
+        payload,
+        extra_headers={"Cache-Control": "no-store"},
+    )
+
+
 def _resolve_new_session_workspace(body, visible_prev_session_id):
     """Resolve a new-session workspace, recovering only verified inheritance."""
     candidate = body.get("workspace")
@@ -14951,6 +15114,10 @@ def handle_post(handler, parsed) -> bool:
         finally:
             if diag:
                 diag.finish()
+    if not _authorize_native_auth_mutation(handler, parsed.path):
+        if diag:
+            diag.finish()
+        return True
     proxy_result = _handle_extension_sidecar_proxy(
         handler,
         parsed,
@@ -16389,6 +16556,12 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/bg-task-complete-ack":
         return _handle_bg_task_complete_ack(handler, body)
+
+    if parsed.path == "/api/native-auth/submit":
+        return _handle_native_auth_submit(handler, body)
+
+    if parsed.path == "/api/native-auth/cancel":
+        return _handle_native_auth_cancel(handler, body)
 
     if parsed.path == "/api/chat/start":
         return _handle_chat_start(handler, body, diag=diag)
